@@ -207,13 +207,15 @@ def _download_stream(url: str, dest: str, *, timeout_s: int, retries: int, backo
     headers = {"User-Agent": "Mozilla/5.0 (compatible; scrape-kabe/1.0)"}
     last_err: Optional[Exception] = None
     for attempt in range(retries + 1):
+        CHUNK_SIZE = 1024 * 512  # 512 KB chunks for faster downloads
+
         try:
             req = urllib.request.Request(url, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 tmp = dest + ".part"
                 with open(tmp, "wb") as out:
                     while True:
-                        chunk = resp.read(1024 * 128)
+                        chunk = resp.read(CHUNK_SIZE)
                         if not chunk:
                             break
                         out.write(chunk)
@@ -286,6 +288,15 @@ def download_pdfs(
 
         safe = _slugify(slug)
         dest = os.path.join(files_dir, f"{safe}.pdf")
+        part_tmp = dest + ".part"
+
+        # Clean up any stale partial download before checking if file exists
+        if os.path.exists(part_tmp):
+            try:
+                os.remove(part_tmp)
+                print(f"[pdf] cleaned stale partial: {part_tmp}", flush=True)
+            except OSError:
+                pass
 
         def _embed(dest_path: str) -> None:
             if not embed_metadata:
@@ -301,7 +312,7 @@ def download_pdfs(
                     write_xmp=True,
                     backup=embed_backup,
                 )
-                print(f"[pdf-meta] {slug}")
+                print(f"[pdf-meta] {slug}", flush=True)
             except Exception as ex:
                 print(f"[pdf-meta] failed {slug}: {ex}", file=sys.stderr)
 
@@ -321,10 +332,11 @@ def download_pdfs(
                     "status": "skipped",
                 }
             )
-            print(f"[pdf] {i}/{n} {slug} -> {dest} (skipped)")
+            print(f"[pdf] {i}/{n} {slug} -> {dest} (skipped)", flush=True)
             _embed(dest)
             continue
 
+        print(f"[pdf] {i}/{n} {slug} -> {dest}", flush=True)
         try:
             _download_stream(pdf_url, dest, timeout_s=timeout_s, retries=retries, backoff_s=backoff_s)
             manifest.append(
@@ -361,7 +373,7 @@ def download_pdfs(
                     "error": str(e),
                 }
             )
-            print(f"[pdf] failed {i}/{n} {slug}: {e}", file=sys.stderr)
+            print(f"[pdf] failed {i}/{n} {slug}: {e}", file=sys.stderr, flush=True)
 
         if sleep_s > 0:
             time.sleep(sleep_s)

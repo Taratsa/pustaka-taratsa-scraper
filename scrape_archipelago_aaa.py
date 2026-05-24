@@ -2,12 +2,12 @@
 """
 Scraper for https://archive.org/details/@archipelago-anti-authoritarian-archive/
 
-Uses the `internetarchive` Python library for searching and metadata retrieval.
-Downloads PDFs via urllib with URL-encoded paths (handles spaces in filenames).
+Uses the `internetarchive` Python library for metadata retrieval.
+Searches via archive.org advanced search API using the uploader email.
 
 This scraper:
-  1. Searches for items in the favorites collection using internetarchive.
-  2. For each item, fetches full metadata via get_item().
+  1. Searches for items by uploader email via archive.org API.
+  2. For each item, fetches full metadata via internetarchive.get_item().
   3. Optionally downloads PDF files.
   4. Writes books.json + books.csv + optional files manifest.
 """
@@ -20,12 +20,13 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed as concurrent_futures_as_completed
+from typing import Any, Dict, List, Optional
 
 import internetarchive
 
 ACCOUNT_ID = "@archipelago-anti-authoritarian-archive"
-FAV_COLLECTION_ID = "fav-archipelago-anti-authoritarian-archive"
+UPLOADER_EMAIL = "archipelagoanarchistarchive@protonmail.com"
 PUBLISHER = "Archipelago Anti-Authoritarian Archive"
 
 
@@ -58,110 +59,193 @@ def search_items(
             time.sleep(sleep_s * attempt)
 
 
+def get_all_identifiers_via_api(
+    *,
+    uploader_email: str,
+    retries: int = 3,
+) -> List[str]:
+    """
+    Fetch all item identifiers for a given uploader email via archive.org API.
+    Uses the advanced search API which supports uploader:email queries.
+    """
+    import requests
+
+    identifiers: List[str] = []
+    rows = 1000
+    page = 1
+
+    while True:
+        try:
+            resp = requests.get(
+                "https://archive.org/advancedsearch.php",
+                params={
+                    "q": f"uploader:{uploader_email}",
+                    "fl[]": ["identifier"],
+                    "output": "json",
+                    "rows": rows,
+                    "page": page,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            docs = data.get("response", {}).get("docs", [])
+            if not docs:
+                break
+            for doc in docs:
+                ident = doc.get("identifier")
+                if ident:
+                    identifiers.append(ident)
+            total = data.get("response", {}).get("numFound", 0)
+            print(f"[search] page {page}: got {len(docs)} items ({len(identifiers)}/{total})")
+            if len(identifiers) >= total:
+                break
+            page += 1
+            time.sleep(0.5)
+        except Exception as e:
+            if retries <= 0:
+                raise RuntimeError(f"get_all_identifiers_via_api failed: {e}") from e
+            print(f"[search] retry {retries}: {e}")
+            time.sleep(1)
+            return get_all_identifiers_via_api(uploader_email=uploader_email, retries=retries - 1)
+
+    return identifiers
+
+
 # ---------------------------------------------------------------------------
 # Fetch full metadata for all items
 # ---------------------------------------------------------------------------
+
+def _fetch_single_item(ident: str, retries: int) -> Optional[Dict[str, Any]]:
+    """Fetch metadata for a single identifier. Returns None on failure."""
+    for attempt in range(retries + 1):
+        try:
+            item = internetarchive.get_item(ident)
+            return _item_to_row(item)
+        except Exception as e:
+            if attempt >= retries:
+                print(f"  [fail] {ident}: {e}", file=sys.stderr)
+                return None
+    return None
+
+
+def _item_to_row(item: Any) -> Dict[str, Any]:
+    """Convert an internetarchive Item to a metadata row dict."""
+    meta = item.metadata
+    files_list = item.files
+
+    row: Dict[str, Any] = {
+        # Core identifiers
+        "archive_identifier": item.identifier,
+        "archive_url": f"https://archive.org/details/{item.identifier}",
+        "cover_url": f"https://archive.org/services/img/{item.identifier}",
+        "download_url": f"https://archive.org/download/{item.identifier}",
+        # Basic metadata
+        "title": meta.get("title", ""),
+        "creator": meta.get("creator", ""),
+        "publisher": meta.get("publisher", ""),
+        "date": meta.get("date", ""),
+        "language": meta.get("language", ""),
+        "mediatype": meta.get("mediatype", ""),
+        "description": meta.get("description", ""),
+        # Subject/keywords
+        "subject": meta.get("subject", ""),
+        "rights": meta.get("rights", ""),
+        # Archive.org specific
+        "identifier_access": meta.get("identifier-access", ""),
+        "identifier_ark": meta.get("identifier-ark", ""),
+        "uploader": meta.get("uploader", ""),
+        "addeddate": meta.get("addeddate", ""),
+        "publicdate": meta.get("publicdate", ""),
+        "access_restricted_item": meta.get("access-restricted-item", ""),
+        "collection": meta.get("collection", []),
+        # Technical metadata
+        "imagecount": meta.get("imagecount", ""),
+        "scanner": meta.get("scanner", ""),
+        "ppi": meta.get("ppi", ""),
+        # OCR info
+        "ocr_detected_lang": meta.get("ocr_detected_lang", ""),
+        "ocr_autonomous": meta.get("ocr_autonomous", ""),
+    }
+
+    # Normalize subject
+    subj = row["subject"]
+    if isinstance(subj, str):
+        row["subject"] = [s.strip() for s in subj.split(",") if s.strip()]
+    elif isinstance(subj, list):
+        row["subject"] = [str(s) for s in subj]
+    else:
+        row["subject"] = []
+
+    # Normalize collection
+    coll = row["collection"]
+    if isinstance(coll, str):
+        row["collection"] = [c.strip() for c in coll.split(",") if c.strip()]
+    elif isinstance(coll, list):
+        row["collection"] = [str(c) for c in coll]
+    else:
+        row["collection"] = []
+
+    # Collect available PDF and EPUB files with metadata
+    ebext_files: List[Dict[str, Any]] = []
+    for f in files_list:
+        if not isinstance(f, dict):
+            continue
+        name = f.get("name", "")
+        if not (name.lower().endswith(".pdf") or name.lower().endswith(".epub")):
+            continue
+        ebext_files.append({
+            "name": name,
+            "format": f.get("format", ""),
+            "source": f.get("source", ""),
+            "length": f.get("length") or "",
+            "title": f.get("title") or "",
+        })
+
+    row["_ebext_files"] = ebext_files
+    return row
+
 
 def fetch_all_items(
     *,
     identifiers: List[str],
     retries: int,
-    sleep_s: float,
+    max_workers: int = 8,
 ) -> List[Dict[str, Any]]:
     """
-    For each identifier, fetch full Item metadata via internetarchive.get_item().
-    Returns list of enriched item dicts.
+    Fetch full Item metadata for all identifiers in parallel.
+    Uses ThreadPoolExecutor for concurrent requests.
     """
-    items: List[Dict[str, Any]] = []
     total = len(identifiers)
+    items: List[Dict[str, Any]] = []
 
-    for i, ident in enumerate(identifiers, start=1):
-        item = None
-        for attempt in range(retries + 1):
-            try:
-                item = internetarchive.get_item(ident)
-                break
-            except Exception as e:
-                if attempt >= retries:
-                    print(f"[{i}/{total}] failed {ident}: {e}", file=sys.stderr)
-                    break
-                time.sleep(1.0 * (attempt + 1))
-
-        if item is None:
-            continue
-
-        meta = item.metadata
-        files_list = item.files
-
-        # Extract relevant metadata fields
-        row: Dict[str, Any] = {
-            "archive_identifier": item.identifier,
-            "archive_url": f"https://archive.org/details/{item.identifier}",
-            "title": meta.get("title", ""),
-            "description": meta.get("description", ""),
-            "creator": meta.get("creator", ""),
-            "date": meta.get("date", ""),
-            "language": meta.get("language", ""),
-            "mediatype": meta.get("mediatype", ""),
-            "subject": meta.get("subject", ""),
-            "identifier_access": meta.get("identifier-access", ""),
-            "identifier_ark": meta.get("identifier-ark", ""),
-            "uploader": meta.get("uploader", ""),
-            "addeddate": meta.get("addeddate", ""),
-            "publicdate": meta.get("publicdate", ""),
-            "access_restricted_item": meta.get("access-restricted-item", ""),
-            "collection": meta.get("collection", []),
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_single_item, ident, retries): ident
+            for ident in identifiers
         }
+        for i, future in enumerate(concurrent_futures_as_completed(futures), start=1):
+            ident = futures[future]
+            result = future.result()
+            if result is not None:
+                items.append(result)
+                print(f"[{i}/{total}] {ident} | {result['mediatype']} | {'RESTRICTED' if result['access_restricted_item'] else 'ok'}")
+            else:
+                print(f"[{i}/{total}] {ident} | FAILED")
 
-        # Normalize subject
-        subj = row["subject"]
-        if isinstance(subj, str):
-            row["subject"] = [s.strip() for s in subj.split(",") if s.strip()]
-        elif isinstance(subj, list):
-            row["subject"] = [str(s) for s in subj]
-        else:
-            row["subject"] = []
-
-        # Normalize collection
-        coll = row["collection"]
-        if isinstance(coll, str):
-            row["collection"] = [c.strip() for c in coll.split(",") if c.strip()]
-        elif isinstance(coll, list):
-            row["collection"] = [str(c) for c in coll]
-        else:
-            row["collection"] = []
-
-        # Collect available PDF files with metadata
-        pdf_files: List[Dict[str, Any]] = []
-        for f in files_list:
-            if not isinstance(f, dict):
-                continue
-            name = f.get("name", "")
-            if not name.lower().endswith(".pdf"):
-                continue
-            pdf_files.append({
-                "name": name,
-                "format": f.get("format", ""),
-                "source": f.get("source", ""),
-                "length": f.get("length") or "",
-                "title": f.get("title") or "",
-            })
-
-        row["_pdf_files"] = pdf_files
-        items.append(row)
-        print(f"[{i}/{total}] {ident} | {row['mediatype']} | {'RESTRICTED' if row['access_restricted_item'] else 'ok'}")
-
-        if sleep_s > 0 and i < total:
-            time.sleep(sleep_s)
+    # Preserve original order
+    id_to_row = {row["archive_identifier"]: row for row in items}
+    ordered = [id_to_row[ident] for ident in identifiers if ident in id_to_row]
+    return ordered
 
     return items
 
 
 # ---------------------------------------------------------------------------
-# Download PDFs
+# Download PDFs/EPUBs
 # ---------------------------------------------------------------------------
 
-def download_pdfs(
+def download_ebext(
     *,
     items: List[Dict[str, Any]],
     files_dir: str,
@@ -170,7 +254,7 @@ def download_pdfs(
     embed_backup: bool,
 ) -> List[Dict[str, Any]]:
     """
-    Download PDFs for each item using internetarchive's item.download().
+    Download PDFs and EPUBs for each item.
     Handles restricted items gracefully.
     """
     # Import here to avoid top-level import issues
@@ -186,35 +270,41 @@ def download_pdfs(
         creator = str(item["creator"] or "")
         date = str(item["date"] or "")
         language = str(item["language"] or "")
+        publisher = str(item.get("publisher") or "")
         subject = item["subject"] or []
         keywords = ", ".join(str(s) for s in subject if s)
         description = str(item["description"] or "")
         restricted = item.get("access_restricted_item") == "true"
-        pdf_files = item.get("_pdf_files", [])
+        ebext_files = item.get("_ebext_files", [])
 
-        if description:
+        # Use description as subject if available and meaningful, otherwise build from publisher/date
+        if description and description not in ("-", "", "None"):
             subject_str = description
+        elif publisher:
+            subject_str = f"{publisher} · {date}" if date else publisher
         elif date:
             subject_str = f"{PUBLISHER} · {date}"
         else:
             subject_str = PUBLISHER
 
-        # Select the best PDF
-        # Prefer: original source > Text PDF > other
+        # Select the best PDF/EPUB
+        # Prefer: original source > Text PDF > Text EPUB > other
         # Skip: ACS Encrypted PDF (restricted)
-        best_pdf: Dict[str, Any] = {}
-        for pdf in pdf_files:
-            format_ = pdf.get("format", "")
+        best_file: Dict[str, Any] = {}
+        for f in ebext_files:
+            format_ = f.get("format", "")
             if format_ == "ACS Encrypted PDF":
                 continue
-            if not best_pdf:
-                best_pdf = pdf
-            elif pdf.get("source") == "original" and best_pdf.get("source") != "original":
-                best_pdf = pdf
-            elif format_ == "Text PDF" and best_pdf.get("format") != "Text PDF":
-                best_pdf = pdf
+            if not best_file:
+                best_file = f
+            elif f.get("source") == "original" and best_file.get("source") != "original":
+                best_file = f
+            elif format_ == "Text PDF" and best_file.get("format") != "Text PDF":
+                best_file = f
+            elif format_ == "Text EPUB" and best_file.get("format") not in ("Text PDF", "Text EPUB"):
+                best_file = f
 
-        if not best_pdf:
+        if not best_file:
             manifest.append({
                 "archive_identifier": identifier,
                 "title": title,
@@ -226,14 +316,14 @@ def download_pdfs(
                 "file_path": None,
                 "file_format": None,
                 "status": "failed",
-                "error": "no accessible PDF (encrypted or missing)",
+                "error": "no accessible PDF/EPUB (encrypted or missing)",
             })
-            print(f"[pdf] {i}/{n} {identifier} -> no accessible PDF (restricted={restricted})")
+            print(f"[file] {i}/{n} {identifier} -> no accessible PDF/EPUB (restricted={restricted})")
             continue
 
-        pdf_name = best_pdf["name"]
+        file_name = best_file["name"]
         # Sanitize filename - replace spaces and special chars for local path
-        safe_name = pdf_name.replace(" ", "_")
+        safe_name = file_name.replace(" ", "_")
         dest = os.path.join(files_dir, f"{identifier}_{safe_name}")
 
         # Check if already downloaded
@@ -245,22 +335,22 @@ def download_pdfs(
                 "date": date,
                 "language": language,
                 "mediatype": item.get("mediatype", ""),
-                "source_url": f"https://archive.org/download/{identifier}/{pdf_name}",
+                "source_url": f"https://archive.org/download/{identifier}/{file_name}",
                 "file_path": dest,
-                "file_format": pdf_name.rsplit(".", 1)[-1] if "." in pdf_name else "pdf",
+                "file_format": file_name.rsplit(".", 1)[-1] if "." in file_name else "pdf",
                 "status": "skipped",
                 "error": None,
             })
-            print(f"[pdf] {i}/{n} {identifier} -> {os.path.basename(dest)} (skipped)")
+            print(f"[file] {i}/{n} {identifier} -> {os.path.basename(dest)} (skipped)")
 
-            # Embed metadata
+            # Embed metadata into PDF only (EPUB metadata embedding not implemented)
             if embed_metadata and dest.lower().endswith(".pdf"):
-                _embed_pdf(dest, title, creator, subject_str, keywords)
+                _embed_pdf(dest, title, creator, publisher, date, subject_str, keywords)
             continue
 
         # Download via direct urllib request (handles spaces/special chars in filenames)
         try:
-            url = f"https://archive.org/download/{identifier}/{urllib.parse.quote(pdf_name)}"
+            url = f"https://archive.org/download/{identifier}/{urllib.parse.quote(file_name)}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; scrape-archipelago-aaa/1.0)"})
             with urllib.request.urlopen(req, timeout=60) as resp:
                 with open(dest, "wb") as f:
@@ -280,15 +370,13 @@ def download_pdfs(
                 "date": date,
                 "language": language,
                 "mediatype": item.get("mediatype", ""),
-                "source_url": f"https://archive.org/download/{identifier}/{pdf_name}",
+                "source_url": f"https://archive.org/download/{identifier}/{file_name}",
                 "file_path": None,
-                "file_format": pdf_name.rsplit(".", 1)[-1] if "." in pdf_name else "pdf",
+                "file_format": file_name.rsplit(".", 1)[-1] if "." in file_name else "pdf",
                 "status": "failed",
                 "error": str(e),
             })
-            print(f"[pdf] failed {i}/{n} {identifier}: {e}", file=sys.stderr)
-            if sleep_s > 0:
-                time.sleep(sleep_s)
+            print(f"[file] failed {i}/{n} {identifier}: {e}", file=sys.stderr)
             continue
 
         # Download succeeded
@@ -299,24 +387,21 @@ def download_pdfs(
             "date": date,
             "language": language,
             "mediatype": item.get("mediatype", ""),
-            "source_url": f"https://archive.org/download/{identifier}/{pdf_name}",
+            "source_url": f"https://archive.org/download/{identifier}/{file_name}",
             "file_path": dest,
-            "file_format": pdf_name.rsplit(".", 1)[-1] if "." in pdf_name else "pdf",
+            "file_format": file_name.rsplit(".", 1)[-1] if "." in file_name else "pdf",
             "status": "downloaded",
             "error": None,
         })
-        print(f"[pdf] {i}/{n} {identifier} -> {os.path.basename(dest)}")
+        print(f"[file] {i}/{n} {identifier} -> {os.path.basename(dest)}")
 
         if embed_metadata and dest.lower().endswith(".pdf"):
-            _embed_pdf(dest, title, creator, subject_str, keywords)
-
-        if sleep_s > 0:
-            time.sleep(sleep_s)
+            _embed_pdf(dest, title, creator, publisher, date, subject_str, keywords)
 
     return manifest
 
 
-def _embed_pdf(path: str, title: str, author: str, subject: str, keywords: str) -> None:
+def _embed_pdf(path: str, title: str, author: str, publisher: str, date: str, subject: str, keywords: str) -> None:
     """Embed metadata into a PDF file."""
     from pdf_metadata_embed import embed_pdf_metadata
     try:
@@ -326,7 +411,8 @@ def _embed_pdf(path: str, title: str, author: str, subject: str, keywords: str) 
             author=author,
             subject=subject,
             keywords=keywords,
-            publisher=PUBLISHER,
+            publisher=publisher if publisher else PUBLISHER,
+            creation_date=date,
             write_xmp=True,
             backup=False,
         )
@@ -350,7 +436,8 @@ def write_outputs(
     # Strip internal _pdf_files key before writing
     items_out = []
     for item in items:
-        item_copy = {k: v for k, v in item.items() if not k.startswith("_")}
+        item_copy = dict(item)
+        item_copy.pop("_ebext_files", None)
         items_out.append(item_copy)
 
     with open(os.path.join(out_dir, "books.json"), "w", encoding="utf-8") as f:
@@ -430,12 +517,19 @@ def write_files_manifest(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=f"Scrape archive.org account {ACCOUNT_ID} via its Favorites collection"
+        description=f"Scrape archive.org account {ACCOUNT_ID} via uploader email"
     )
     parser.add_argument("--out-dir", default="output/archipelago-aaa", help="books.json / books.csv")
     parser.add_argument("--timeout-s", type=int, default=60)
     parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--sleep-s", type=float, default=0.15)
+    parser.add_argument("--sleep-s", type=float, default=0.05, help="Deprecated — unused, kept for compat")
+    parser.add_argument("--max-workers", type=int, default=16, help="Parallel workers for metadata fetch")
+
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Re-fetch metadata for ALL items (not just new ones). By default, only new items are fetched.",
+    )
 
     parser.add_argument(
         "--download-pdfs",
@@ -454,37 +548,72 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Search for items in the favorites collection
-    print(f"Searching for items in collection:{FAV_COLLECTION_ID}...")
-    search_results = search_items(
-        query=f"collection:{FAV_COLLECTION_ID}",
-        retries=args.retries,
-        sleep_s=args.sleep_s,
-    )
-    identifiers = [r["identifier"] for r in search_results if r.get("identifier")]
-    print(f"Found {len(identifiers)} items: {identifiers}")
+    books_json_path = os.path.join(args.out_dir, "books.json")
 
-    # Fetch full metadata for each item
-    print("Fetching full metadata for each item...")
-    items = fetch_all_items(
-        identifiers=identifiers,
-        retries=args.retries,
-        sleep_s=args.sleep_s,
-    )
+    # Load existing items to enable incremental fetch
+    existing_items: Dict[str, Dict[str, Any]] = {}
+
+    if args.force_refresh:
+        # Full refresh: ignore existing cache
+        print(f"[refresh] Ignoring existing cache, will fetch all items from archive.org")
+    elif os.path.exists(books_json_path):
+        with open(books_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        existing_items = {item["archive_identifier"]: item for item in data.get("books", [])}
+        print(f"[load] Loaded {len(existing_items)} existing items from {books_json_path}")
+
+    # Search for all identifiers (to discover new ones added since last run)
+    print(f"Searching for items by uploader:{UPLOADER_EMAIL}...")
+    all_identifiers = get_all_identifiers_via_api(uploader_email=UPLOADER_EMAIL, retries=args.retries)
+    print(f"Found {len(all_identifiers)} items total")
+
+    if args.force_refresh:
+        # Re-fetch all items
+        print(f"Fetching metadata for all {len(all_identifiers)} items...")
+        items = fetch_all_items(
+            identifiers=all_identifiers,
+            retries=args.retries,
+            max_workers=args.max_workers,
+        )
+        new_items = items
+    else:
+        # Determine which identifiers are new (not in existing cache)
+        new_identifiers = [ident for ident in all_identifiers if ident not in existing_items]
+        print(f"[diff] {len(existing_items)} cached + {len(new_identifiers)} new")
+
+        # Fetch metadata only for new identifiers
+        if new_identifiers:
+            print(f"Fetching metadata for {len(new_identifiers)} new items...")
+            new_items = fetch_all_items(
+                identifiers=new_identifiers,
+                retries=args.retries,
+                max_workers=args.max_workers,
+            )
+            print(f"Fetched {len(new_items)} new items")
+        else:
+            new_items = []
+
+        # Build ordered list: existing items (preserving archive.org sort order) + new items
+        all_items_dict = dict(existing_items)
+        for item in new_items:
+            all_items_dict[item["archive_identifier"]] = item
+        items = [all_items_dict[ident] for ident in all_identifiers if ident in all_items_dict]
 
     meta = {
         "account_id": ACCOUNT_ID,
-        "favorites_collection": FAV_COLLECTION_ID,
+        "uploader_email": UPLOADER_EMAIL,
         "item_count": len(items),
+        "cached_count": len(existing_items),
+        "new_count": len(new_items),
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-    print(f"Total: {len(items)} items.")
+    print(f"Total: {len(items)} items ({len(existing_items)} cached + {len(new_items)} new).")
     write_outputs(out_dir=args.out_dir, meta=meta, items=items)
     print(f"Wrote: {os.path.join(args.out_dir, 'books.json')} and books.csv")
 
     if args.download_pdfs:
-        manifest = download_pdfs(
+        manifest = download_ebext(
             items=items,
             files_dir=args.files_dir,
             sleep_s=args.pdfs_sleep_s,

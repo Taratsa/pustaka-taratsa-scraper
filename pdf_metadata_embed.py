@@ -28,6 +28,7 @@ def build_xmp_packet(
     subject: str,
     keywords: str,
     publisher: str = "",
+    creation_date: str = "",
 ) -> bytes:
     import xml.sax.saxutils as sx
 
@@ -42,6 +43,15 @@ def build_xmp_packet(
           <rdf:li>{esc(publisher)}</rdf:li>
         </rdf:Bag>
       </dc:publisher>"""
+
+    date_block = ""
+    if creation_date.strip():
+        date_block = f"""
+      <dc:date>
+        <rdf:Bag>
+          <rdf:li>{esc(creation_date)}</rdf:li>
+        </rdf:Bag>
+      </dc:date>"""
 
     xmp = f"""<?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>
 <x:xmpmeta xmlns:x='adobe:ns:meta/'>
@@ -67,7 +77,7 @@ def build_xmp_packet(
         <rdf:Bag>
           <rdf:li>{esc(keywords)}</rdf:li>
         </rdf:Bag>
-      </dc:subject>{publisher_block}
+      </dc:subject>{publisher_block}{date_block}
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -83,6 +93,7 @@ def embed_pdf_metadata(
     subject: str = "",
     keywords: str = "",
     publisher: str = "",
+    creation_date: str = "",
     write_xmp: bool = True,
     backup: bool = False,
 ) -> None:
@@ -108,9 +119,18 @@ def embed_pdf_metadata(
         metadata["/Subject"] = subject
     if keywords:
         metadata["/Keywords"] = keywords
-    # Non-standard but often shown as “Company” in some viewers; XMP dc:publisher is primary.
+    # Non-standard but often shown as "Company" in some viewers; XMP dc:publisher is primary.
     if publisher.strip():
         metadata["/Company"] = publisher.strip()
+    # Store creation date as /CreationDate in PDF info dict (D:YYYYMMDDHHmmSS format)
+    if creation_date.strip():
+        # Parse date - archive.org format is often "2026-02-04 17:29:14" or "2010"
+        import re
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", creation_date)
+        if m:
+            metadata["/CreationDate"] = f"D:{m.group(1)}{m.group(2)}{m.group(3)}"
+        elif re.match(r"^\d{4}$", creation_date.strip()):
+            metadata["/CreationDate"] = f"D:{creation_date.strip()}"
     if not metadata:
         return
 
@@ -134,6 +154,7 @@ def embed_pdf_metadata(
             subject=subject,
             keywords=keywords,
             publisher=publisher,
+            creation_date=creation_date,
         )
         try:
             xmp_stream = DecodedStreamObject()

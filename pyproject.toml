@@ -7,4 +7,5 @@ dependencies = [
     "internetarchive>=5.0.0",
     "requests>=2.34.0",
     "tqdm>=4.67.0",
+    "pypdf>=5.0.0",
 ]
