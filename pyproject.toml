@@ -1,0 +1,10 @@
+[project]
+name = "pustaka-taratsa-scraper"
+version = "0.1.0"
+description = "Scrape books metadata from Indonesian digital library sources"
+requires-python = ">=3.14"
+dependencies = [
+    "internetarchive>=5.0.0",
+    "requests>=2.34.0",
+    "tqdm>=4.67.0",
+]
