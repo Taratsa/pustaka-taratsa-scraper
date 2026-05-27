@@ -71,6 +71,7 @@ def _http_get(url: str, *, timeout_s: int, retries: int, backoff_s: float) -> st
             last_err = e
             if attempt >= retries:
                 break
+            print(f"[retry] {url} — attempt {attempt+1}/{retries+1} failed: {e}")
             time.sleep(backoff_s * (2**attempt) + random.uniform(0, 0.25))
     assert last_err is not None
     raise last_err
@@ -80,6 +81,21 @@ def _parse_eprint_meta(html: str) -> Dict[str, Any]:
     meta_dict: Dict[str, Any] = {}
     for m in re.finditer(
         r'<meta name="eprints\.([^"]+)" content="([^"]*)"',
+        html,
+    ):
+        name = m.group(1)
+        content = m.group(2)
+        if name in meta_dict:
+            existing = meta_dict[name]
+            if isinstance(existing, list):
+                existing.append(content)
+            else:
+                meta_dict[name] = [existing, content]
+        else:
+            meta_dict[name] = content
+    # Also parse Dublin Core (DC.*) meta tags — DC.date is the canonical date field
+    for m in re.finditer(
+        r'<meta name="(DC\.[^"]+)" content="([^"]*)"',
         html,
     ):
         name = m.group(1)
@@ -172,7 +188,8 @@ def _parse_subjects(meta: Dict[str, Any]) -> List[str]:
 
 
 def _parse_date(meta: Dict[str, Any]) -> Tuple[str, str]:
-    date = str(meta.get("date", ""))
+    # Prefer DC.date (Dublin Core canonical date), fall back to eprints.date
+    date = str(meta.get("DC.date", "") or meta.get("date", ""))
     date_type = str(meta.get("date_type", ""))
     year = ""
     if date:
@@ -229,7 +246,10 @@ def scrape_subject_page(
     retries: int,
     backoff_s: float,
     sleep_s: float,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    files_dir: Optional[str] = None,
+    embed_metadata: bool = True,
+    embed_backup: bool = False,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not subject_path.startswith('/'):
         subject_path = '/' + subject_path
     subject_url = urllib.parse.urljoin(BASE_URL, subject_path)
@@ -243,16 +263,89 @@ def scrape_subject_page(
         "item_count": len(items),
     }
 
+    manifest: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
     for i, item in enumerate(items):
+        print(f"[{subject_path}] Fetching item {i+1}/{len(items)}: {item['url']}")
         item_html = _http_get(item["url"], timeout_s=timeout_s, retries=retries, backoff_s=backoff_s)
         row = scrape_item(item["url"], item["id"], item_html)
         row["source_subject"] = subject_path
         results.append(row)
+
+        # Immediately download the PDF for this item
+        item_id = str(row.get("id") or item["id"])
+        pdf_url = row.get("pdf_url")
+        title = str(row.get("title") or item_id)
+        author = str(row.get("author") or "")
+        year = str(row.get("year") or "")
+        date = str(row.get("date") or year)
+        abstract = str(row.get("abstract") or "")
+        publisher = str(row.get("publisher") or PUBLISHER)
+        isbn = str(row.get("isbn") or "")
+        item_type = str(row.get("type") or "")
+        subjects_list = row.get("subjects", [])
+        if isinstance(subjects_list, list):
+            subjects_str = ", ".join(str(s) for s in subjects_list if s)
+        else:
+            subjects_str = str(subjects_list)
+
+        if not pdf_url:
+            manifest.append({
+                "id": item_id, "title": title, "author": author, "year": year,
+                "date": date, "publisher": publisher, "isbn": isbn, "type": item_type,
+                "subjects": subjects_str, "abstract": abstract,
+                "source_url": None, "file_path": None, "status": "failed", "error": "no pdf_url",
+            })
+            print(f"[{subject_path}] No PDF URL for {i+1}/{len(items)}")
+        else:
+            slug = _slugify(title) if title and title != item_id else item_id
+            if files_dir:
+                os.makedirs(files_dir, exist_ok=True)
+                dest = os.path.join(files_dir, f"{slug}.pdf")
+            else:
+                dest = os.path.join("output/kemendikdasmen/files", f"{slug}.pdf")
+
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                manifest.append({
+                    "id": item_id, "title": title, "author": author, "year": year,
+                    "date": date, "publisher": publisher, "isbn": isbn, "type": item_type,
+                    "subjects": subjects_str, "abstract": abstract,
+                    "source_url": pdf_url, "file_path": dest, "status": "skipped",
+                })
+                print(f"[{subject_path}] PDF skipped {i+1}/{len(items)}: {dest}")
+            else:
+                try:
+                    _download_stream(pdf_url, dest, timeout_s=timeout_s, retries=retries, backoff_s=backoff_s)
+                    manifest.append({
+                        "id": item_id, "title": title, "author": author, "year": year,
+                        "date": date, "publisher": publisher, "isbn": isbn, "type": item_type,
+                        "subjects": subjects_str, "abstract": abstract,
+                        "source_url": pdf_url, "file_path": dest, "status": "downloaded",
+                    })
+                    print(f"[{subject_path}] Downloaded {i+1}/{len(items)}: {dest}")
+                    if embed_metadata:
+                        try:
+                            embed_pdf_metadata(
+                                dest, title=title, author=author, subject=subjects_str or PUBLISHER,
+                                keywords=subjects_str, publisher=publisher or PUBLISHER,
+                                publication_date=date or year, write_xmp=True, backup=embed_backup,
+                            )
+                            print(f"[{subject_path}] Metadata embedded {i+1}/{len(items)}")
+                        except Exception as ex:
+                            print(f"[{subject_path}] Metadata embed failed {i+1}/{len(items)}: {ex}", file=sys.stderr)
+                except Exception as e:
+                    manifest.append({
+                        "id": item_id, "title": title, "author": author, "year": year,
+                        "date": date, "publisher": publisher, "isbn": isbn, "type": item_type,
+                        "subjects": subjects_str, "abstract": abstract,
+                        "source_url": pdf_url, "file_path": None, "status": "failed", "error": str(e),
+                    })
+                    print(f"[{subject_path}] Download failed {i+1}/{len(items)}: {e}", file=sys.stderr)
+
         if sleep_s > 0 and i + 1 < len(items):
             time.sleep(sleep_s)
 
-    return meta, results
+    return meta, results, manifest
 
 
 def write_outputs(*, out_dir: str, meta: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
@@ -343,6 +436,7 @@ def download_pdfs(
         title = str(item.get("title") or item_id)
         author = str(item.get("author") or "")
         year = str(item.get("year") or "")
+        date = str(item.get("date") or year)
         abstract = str(item.get("abstract") or "")
         publisher = str(item.get("publisher") or PUBLISHER)
         isbn = str(item.get("isbn") or "")
@@ -359,6 +453,7 @@ def download_pdfs(
                 "title": title,
                 "author": author,
                 "year": year,
+                "date": date,
                 "publisher": publisher,
                 "isbn": isbn,
                 "type": item_type,
@@ -385,6 +480,7 @@ def download_pdfs(
                     subject=subjects_str or PUBLISHER,
                     keywords=subjects_str,
                     publisher=publisher or PUBLISHER,
+                    publication_date=date or year,
                     write_xmp=True,
                     backup=embed_backup,
                 )
@@ -398,6 +494,7 @@ def download_pdfs(
                 "title": title,
                 "author": author,
                 "year": year,
+                "date": date,
                 "publisher": publisher,
                 "isbn": isbn,
                 "type": item_type,
@@ -418,6 +515,7 @@ def download_pdfs(
                 "title": title,
                 "author": author,
                 "year": year,
+                "date": date,
                 "publisher": publisher,
                 "isbn": isbn,
                 "type": item_type,
@@ -435,6 +533,7 @@ def download_pdfs(
                 "title": title,
                 "author": author,
                 "year": year,
+                "date": date,
                 "publisher": publisher,
                 "isbn": isbn,
                 "type": item_type,
@@ -460,7 +559,7 @@ def write_manifest(*, files_dir: str, manifest: List[Dict[str, Any]]) -> None:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     cpath = os.path.join(files_dir, "items_manifest.csv")
     fields = [
-        "id", "title", "author", "year", "publisher", "isbn", "type",
+        "id", "title", "author", "year", "date", "publisher", "isbn", "type",
         "subjects", "abstract", "source_url", "file_path", "status", "error",
     ]
     with open(cpath, "w", encoding="utf-8", newline="") as f:
@@ -479,7 +578,6 @@ def run_subject(
     retries: int,
     backoff_s: float,
     sleep_s: float,
-    should_download_pdfs: bool,
     embed_metadata: bool,
     embed_backup: bool,
     parent_path: Optional[str] = None,
@@ -494,30 +592,21 @@ def run_subject(
         out_dir = os.path.join(base_out_dir, folder_slug)
         files_dir = os.path.join(base_files_dir, folder_slug)
 
-    meta, items = scrape_subject_page(
+    meta, items, manifest = scrape_subject_page(
         subject_path=subject_path,
         timeout_s=timeout_s,
         retries=retries,
         backoff_s=backoff_s,
         sleep_s=sleep_s,
+        files_dir=files_dir,
+        embed_metadata=embed_metadata,
+        embed_backup=embed_backup,
     )
-    print(f"[{folder_slug}] Found {len(items)} items.")
+    print(f"[{folder_slug}] Scraped {len(items)} items, {sum(1 for m in manifest if m['status']=='downloaded')} PDFs downloaded.")
     write_outputs(out_dir=out_dir, meta=meta, items=items)
     print(f"[{folder_slug}] Wrote: {os.path.join(out_dir, 'items.json')} and items.csv")
-
-    if should_download_pdfs:
-        manifest = download_pdfs(
-            items=items,
-            files_dir=files_dir,
-            timeout_s=timeout_s,
-            retries=retries,
-            backoff_s=backoff_s,
-            sleep_s=sleep_s,
-            embed_metadata=embed_metadata,
-            embed_backup=embed_backup,
-        )
-        write_manifest(files_dir=files_dir, manifest=manifest)
-        print(f"[{folder_slug}] Wrote: {os.path.join(files_dir, 'items_manifest.json')}")
+    write_manifest(files_dir=files_dir, manifest=manifest)
+    print(f"[{folder_slug}] Wrote: {os.path.join(files_dir, 'items_manifest.json')}")
 
 
 def main() -> None:
@@ -529,17 +618,11 @@ def main() -> None:
     p.add_argument("--backoff-s", type=float, default=0.5)
     p.add_argument("--sleep-s", type=float, default=0.15)
 
-    p.add_argument(
-        "--download-pdfs",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Download missing PDFs into --files-dir (default: enabled)",
-    )
     p.add_argument("--files-dir", default="output/kemendikdasmen/files", help="Base files directory")
     p.add_argument(
         "--no-embed-pdf-metadata",
         action="store_true",
-        help="With --download-pdfs, do not embed metadata into PDFs",
+        help="Do not embed metadata into PDFs",
     )
     p.add_argument("--embed-backup", action="store_true", help="Create .bak before embedding")
 
@@ -571,7 +654,6 @@ def main() -> None:
                 retries=args.retries,
                 backoff_s=args.backoff_s,
                 sleep_s=args.sleep_s,
-                should_download_pdfs=args.download_pdfs,
                 embed_metadata=embed_metadata,
                 embed_backup=args.embed_backup,
                 parent_path=parent_path,
@@ -595,7 +677,6 @@ def main() -> None:
                 retries=args.retries,
                 backoff_s=args.backoff_s,
                 sleep_s=args.sleep_s,
-                should_download_pdfs=args.download_pdfs,
                 embed_metadata=embed_metadata,
                 embed_backup=args.embed_backup,
                 parent_path=found.get("parent_path"),
@@ -628,7 +709,6 @@ def main() -> None:
             retries=args.retries,
             backoff_s=args.backoff_s,
             sleep_s=args.sleep_s,
-            should_download_pdfs=args.download_pdfs,
             embed_metadata=embed_metadata,
             embed_backup=args.embed_backup,
             parent_path=s.get("parent_path"),

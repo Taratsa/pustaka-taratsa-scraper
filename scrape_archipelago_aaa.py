@@ -113,7 +113,7 @@ def get_all_identifiers_via_api(
 
 
 # ---------------------------------------------------------------------------
-# Fetch full metadata for all items
+# Fetch single item metadata + select best PDF/EPUB
 # ---------------------------------------------------------------------------
 
 def _fetch_single_item(ident: str, retries: int) -> Optional[Dict[str, Any]]:
@@ -203,14 +203,39 @@ def _item_to_row(item: Any) -> Dict[str, Any]:
         })
 
     row["_ebext_files"] = ebext_files
+
+    # Pre-select the best PDF/EPUB for this item
+    row["_best_file"] = _select_best_file(ebext_files)
     return row
+
+
+def _select_best_file(ebext_files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Select the best PDF/EPUB from a list of file entries.
+    Prefer: original source > Text PDF > Text EPUB > other.
+    Skip: ACS Encrypted PDF (restricted).
+    """
+    best: Dict[str, Any] = {}
+    for f in ebext_files:
+        format_ = f.get("format", "")
+        if format_ == "ACS Encrypted PDF":
+            continue
+        if not best:
+            best = f
+        elif f.get("source") == "original" and best.get("source") != "original":
+            best = f
+        elif format_ == "Text PDF" and best.get("format") not in ("Text PDF", "Text EPUB"):
+            best = f
+        elif format_ == "Text EPUB" and best.get("format") not in ("Text PDF", "Text EPUB"):
+            best = f
+    return best
 
 
 def fetch_all_items(
     *,
     identifiers: List[str],
     retries: int,
-    max_workers: int = 8,
+    max_workers: int = 2,
 ) -> List[Dict[str, Any]]:
     """
     Fetch full Item metadata for all identifiers in parallel.
@@ -237,8 +262,6 @@ def fetch_all_items(
     id_to_row = {row["archive_identifier"]: row for row in items}
     ordered = [id_to_row[ident] for ident in identifiers if ident in id_to_row]
     return ordered
-
-    return items
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +298,6 @@ def download_ebext(
         keywords = ", ".join(str(s) for s in subject if s)
         description = str(item["description"] or "")
         restricted = item.get("access_restricted_item") == "true"
-        ebext_files = item.get("_ebext_files", [])
 
         # Use description as subject if available and meaningful, otherwise build from publisher/date
         if description and description not in ("-", "", "None"):
@@ -287,23 +309,8 @@ def download_ebext(
         else:
             subject_str = PUBLISHER
 
-        # Select the best PDF/EPUB
-        # Prefer: original source > Text PDF > Text EPUB > other
-        # Skip: ACS Encrypted PDF (restricted)
-        best_file: Dict[str, Any] = {}
-        for f in ebext_files:
-            format_ = f.get("format", "")
-            if format_ == "ACS Encrypted PDF":
-                continue
-            if not best_file:
-                best_file = f
-            elif f.get("source") == "original" and best_file.get("source") != "original":
-                best_file = f
-            elif format_ == "Text PDF" and best_file.get("format") != "Text PDF":
-                best_file = f
-            elif format_ == "Text EPUB" and best_file.get("format") not in ("Text PDF", "Text EPUB"):
-                best_file = f
-
+        # Use pre-selected best file (populated during metadata fetch via _select_best_file)
+        best_file = item.get("_best_file") or {}
         if not best_file:
             manifest.append({
                 "archive_identifier": identifier,
@@ -433,11 +440,18 @@ def write_outputs(
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
-    # Strip internal _pdf_files key before writing
+    # Strip internal keys before writing (but keep _ebext_files for incremental re-runs)
     items_out = []
     for item in items:
         item_copy = dict(item)
-        item_copy.pop("_ebext_files", None)
+        # _ebext_files is needed by download_ebext() on subsequent runs when
+        # items are loaded from books.json cache instead of freshly fetched.
+        item_copy.pop("imagecount", None)
+        item_copy.pop("scanner", None)
+        item_copy.pop("ppi", None)
+        item_copy.pop("ocr_detected_lang", None)
+        item_copy.pop("ocr_autonomous", None)
+        item_copy.pop("identifier_access", None)
         items_out.append(item_copy)
 
     with open(os.path.join(out_dir, "books.json"), "w", encoding="utf-8") as f:
@@ -523,7 +537,7 @@ def main() -> None:
     parser.add_argument("--timeout-s", type=int, default=60)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--sleep-s", type=float, default=0.05, help="Deprecated — unused, kept for compat")
-    parser.add_argument("--max-workers", type=int, default=16, help="Parallel workers for metadata fetch")
+    parser.add_argument("--max-workers", type=int, default=16, help="Deprecated — unused, sequential per-item processing")
 
     parser.add_argument(
         "--force-refresh",
@@ -549,12 +563,13 @@ def main() -> None:
     args = parser.parse_args()
 
     books_json_path = os.path.join(args.out_dir, "books.json")
+    files_dir = args.files_dir
+    os.makedirs(files_dir, exist_ok=True)
 
     # Load existing items to enable incremental fetch
     existing_items: Dict[str, Dict[str, Any]] = {}
 
     if args.force_refresh:
-        # Full refresh: ignore existing cache
         print(f"[refresh] Ignoring existing cache, will fetch all items from archive.org")
     elif os.path.exists(books_json_path):
         with open(books_json_path, "r", encoding="utf-8") as f:
@@ -567,61 +582,254 @@ def main() -> None:
     all_identifiers = get_all_identifiers_via_api(uploader_email=UPLOADER_EMAIL, retries=args.retries)
     print(f"Found {len(all_identifiers)} items total")
 
-    if args.force_refresh:
-        # Re-fetch all items
-        print(f"Fetching metadata for all {len(all_identifiers)} items...")
-        items = fetch_all_items(
-            identifiers=all_identifiers,
-            retries=args.retries,
-            max_workers=args.max_workers,
-        )
-        new_items = items
-    else:
-        # Determine which identifiers are new (not in existing cache)
-        new_identifiers = [ident for ident in all_identifiers if ident not in existing_items]
-        print(f"[diff] {len(existing_items)} cached + {len(new_identifiers)} new")
+    # ---- Per-item sequential processing ----
+    # For each item: 1. fetch metadata (if new/forced) → 2. download → 3. embed → 4. write
+    all_items: List[Dict[str, Any]] = []
+    manifest: List[Dict[str, Any]] = []
+    n = len(all_identifiers)
 
-        # Fetch metadata only for new identifiers
-        if new_identifiers:
-            print(f"Fetching metadata for {len(new_identifiers)} new items...")
-            new_items = fetch_all_items(
-                identifiers=new_identifiers,
-                retries=args.retries,
-                max_workers=args.max_workers,
-            )
-            print(f"Fetched {len(new_items)} new items")
+    for i, ident in enumerate(all_identifiers, start=1):
+        item: Dict[str, Any]
+
+        # Step 1: Get item metadata
+        if args.force_refresh or ident not in existing_items:
+            row = _fetch_single_item(ident, args.retries)
+            if row is None:
+                print(f"[{i}/{n}] {ident} | FAILED metadata fetch, skipping")
+                continue
+            item = row
+            if i % 50 == 0 or i == 1:
+                print(f"[{i}/{n}] {ident} | {item['mediatype']} | RESTRICTED={bool(item['access_restricted_item'])}")
         else:
-            new_items = []
+            cached = existing_items[ident]
+            # Ensure cached item has _best_file (back-compat for items cached before this fix).
+            # If _ebext_files is also missing/None, treat as cache miss and refetch from archive.org.
+            if "_best_file" not in cached or cached.get("_ebext_files") is None:
+                row = _fetch_single_item(ident, args.retries)
+                if row is None:
+                    print(f"[{i}/{n}] {ident} | FAILED metadata re-fetch, skipping")
+                    continue
+                item = row
+                if i % 50 == 0 or i == 1:
+                    print(f"[{i}/{n}] {ident} | {item['mediatype']} | RESTRICTED={bool(item['access_restricted_item'])}")
+            else:
+                item = cached
 
-        # Build ordered list: existing items (preserving archive.org sort order) + new items
-        all_items_dict = dict(existing_items)
-        for item in new_items:
-            all_items_dict[item["archive_identifier"]] = item
-        items = [all_items_dict[ident] for ident in all_identifiers if ident in all_items_dict]
+        all_items.append(item)
 
+        # Step 2: Download (if enabled)
+        if args.download_pdfs:
+            file_manifest = _download_single(
+                item=item,
+                files_dir=files_dir,
+                embed_metadata=not args.no_embed_pdf_metadata,
+                embed_backup=args.embed_backup,
+                index=i,
+                total=n,
+            )
+            if file_manifest:
+                manifest.append(file_manifest)
+
+        # Step 3: Write books.json incrementally (flush every 100 items)
+        if i % 100 == 0 or i == n:
+            _flush_outputs(args.out_dir, all_items, manifest)
+            print(f"[flush] {i}/{n} items written to books.json")
+
+    # Final flush
     meta = {
         "account_id": ACCOUNT_ID,
         "uploader_email": UPLOADER_EMAIL,
-        "item_count": len(items),
-        "cached_count": len(existing_items),
-        "new_count": len(new_items),
+        "item_count": len(all_items),
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    _flush_outputs(args.out_dir, all_items, manifest, meta=meta)
+    print(f"Done. {len(all_items)} items, {len(manifest)} files processed.")
+    write_files_manifest(files_dir=files_dir, manifest=manifest)
+    print(f"Wrote: {os.path.join(files_dir, 'files_manifest.json')}")
 
-    print(f"Total: {len(items)} items ({len(existing_items)} cached + {len(new_items)} new).")
-    write_outputs(out_dir=args.out_dir, meta=meta, items=items)
-    print(f"Wrote: {os.path.join(args.out_dir, 'books.json')} and books.csv")
 
-    if args.download_pdfs:
-        manifest = download_ebext(
-            items=items,
-            files_dir=args.files_dir,
-            sleep_s=args.pdfs_sleep_s,
-            embed_metadata=not args.no_embed_pdf_metadata,
-            embed_backup=args.embed_backup,
-        )
-        write_files_manifest(files_dir=args.files_dir, manifest=manifest)
-        print(f"Wrote: {os.path.join(args.files_dir, 'files_manifest.json')}")
+def _download_single(
+    *,
+    item: Dict[str, Any],
+    files_dir: str,
+    embed_metadata: bool,
+    embed_backup: bool,
+    index: int,
+    total: int,
+) -> Optional[Dict[str, Any]]:
+    """Download, embed metadata, and return a manifest entry for a single item."""
+    from pdf_metadata_embed import embed_pdf_metadata
+
+    identifier = item["archive_identifier"]
+    title = str(item["title"] or identifier)
+    creator = str(item["creator"] or "")
+    date = str(item["date"] or "")
+    language = str(item["language"] or "")
+    publisher = str(item.get("publisher") or "")
+    subject = item["subject"] or []
+    keywords = ", ".join(str(s) for s in subject if s)
+    description = str(item["description"] or "")
+    restricted = item.get("access_restricted_item") == "true"
+    best_file = item.get("_best_file") or {}
+
+    # Build subject string
+    if description and description not in ("-", "", "None"):
+        subject_str = description
+    elif publisher:
+        subject_str = f"{publisher} · {date}" if date else publisher
+    elif date:
+        subject_str = f"{PUBLISHER} · {date}"
+    else:
+        subject_str = PUBLISHER
+
+    if not best_file:
+        print(f"[file] {index}/{total} {identifier} -> no accessible PDF/EPUB (restricted={restricted})")
+        return {
+            "archive_identifier": identifier,
+            "title": title,
+            "creator": creator,
+            "date": date,
+            "language": language,
+            "mediatype": item.get("mediatype", ""),
+            "source_url": None,
+            "file_path": None,
+            "file_format": None,
+            "status": "failed",
+            "error": "no accessible PDF/EPUB (encrypted or missing)",
+        }
+
+    file_name = best_file["name"]
+    safe_name = file_name.replace(" ", "_")
+    dest = os.path.join(files_dir, f"{identifier}_{safe_name}")
+
+    # Check if already downloaded
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        manifest_entry = {
+            "archive_identifier": identifier,
+            "title": title,
+            "creator": creator,
+            "date": date,
+            "language": language,
+            "mediatype": item.get("mediatype", ""),
+            "source_url": f"https://archive.org/download/{identifier}/{file_name}",
+            "file_path": dest,
+            "file_format": file_name.rsplit(".", 1)[-1] if "." in file_name else "pdf",
+            "status": "skipped",
+            "error": None,
+        }
+        if embed_metadata and dest.lower().endswith(".pdf"):
+            _embed_pdf(dest, title, creator, publisher, date, subject_str, keywords)
+        return manifest_entry
+
+    # Download
+    try:
+        url = f"https://archive.org/download/{identifier}/{urllib.parse.quote(file_name)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; scrape-archipelago-aaa/1.0)"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(1024 * 128)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if os.path.getsize(dest) == 0:
+            os.remove(dest)
+            raise RuntimeError("downloaded file is 0 bytes")
+    except Exception as e:
+        print(f"[file] failed {index}/{total} {identifier}: {e}", file=sys.stderr)
+        return {
+            "archive_identifier": identifier,
+            "title": title,
+            "creator": creator,
+            "date": date,
+            "language": language,
+            "mediatype": item.get("mediatype", ""),
+            "source_url": f"https://archive.org/download/{identifier}/{file_name}",
+            "file_path": None,
+            "file_format": file_name.rsplit(".", 1)[-1] if "." in file_name else "pdf",
+            "status": "failed",
+            "error": str(e),
+        }
+
+    print(f"[file] {index}/{total} {identifier} -> {os.path.basename(dest)}")
+    if embed_metadata and dest.lower().endswith(".pdf"):
+        _embed_pdf(dest, title, creator, publisher, date, subject_str, keywords)
+
+    return {
+        "archive_identifier": identifier,
+        "title": title,
+        "creator": creator,
+        "date": date,
+        "language": language,
+        "mediatype": item.get("mediatype", ""),
+        "source_url": f"https://archive.org/download/{identifier}/{file_name}",
+        "file_path": dest,
+        "file_format": file_name.rsplit(".", 1)[-1] if "." in file_name else "pdf",
+        "status": "downloaded",
+        "error": None,
+    }
+
+
+def _flush_outputs(
+    out_dir: str,
+    items: List[Dict[str, Any]],
+    manifest: List[Dict[str, Any]],
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Write books.json incrementally.
+    Strips noisy technical metadata fields but preserves _ebext_files and _best_file
+    so subsequent runs can load from cache without re-fetching.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Strip noisy technical keys but keep _ebext_files and _best_file for cache re-use
+    items_out = []
+    for item in items:
+        item_copy = dict(item)
+        item_copy.pop("imagecount", None)
+        item_copy.pop("scanner", None)
+        item_copy.pop("ppi", None)
+        item_copy.pop("ocr_detected_lang", None)
+        item_copy.pop("ocr_autonomous", None)
+        item_copy.pop("identifier_access", None)
+        items_out.append(item_copy)
+
+    # Build meta if not provided
+    if meta is None:
+        meta = {
+            "account_id": ACCOUNT_ID,
+            "uploader_email": UPLOADER_EMAIL,
+            "item_count": len(items),
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    with open(os.path.join(out_dir, "books.json"), "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "books": items_out}, f, ensure_ascii=False, indent=2)
+
+    keys = set()
+    for b in items_out:
+        keys.update(b.keys())
+
+    preferred = [
+        "archive_identifier", "archive_url", "title", "description", "creator",
+        "date", "language", "mediatype", "subject", "collection", "uploader",
+        "addeddate", "publicdate", "identifier_ark", "access_restricted_item",
+    ]
+    fieldnames = [k for k in preferred if k in keys] + sorted(keys - set(preferred))
+
+    with open(os.path.join(out_dir, "books.csv"), "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for b in items_out:
+            row = dict(b)
+            subj = row.get("subject")
+            if isinstance(subj, list):
+                row["subject"] = "|".join(str(s) for s in subj)
+            coll = row.get("collection")
+            if isinstance(coll, list):
+                row["collection"] = "|".join(str(c) for c in coll)
+            w.writerow(row)
 
 
 if __name__ == "__main__":

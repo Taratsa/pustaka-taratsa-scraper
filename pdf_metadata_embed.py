@@ -47,16 +47,17 @@ def build_xmp_packet(
     date_block = ""
     if creation_date.strip():
         date_block = f"""
-      <dc:date>
+      <DC:date>
         <rdf:Bag>
           <rdf:li>{esc(creation_date)}</rdf:li>
         </rdf:Bag>
-      </dc:date>"""
+      </DC:date>"""
 
     xmp = f"""<?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>
 <x:xmpmeta xmlns:x='adobe:ns:meta/'>
   <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'
-           xmlns:dc='http://purl.org/dc/elements/1.1/'>
+           xmlns:dc='http://purl.org/dc/elements/1.1/'
+           xmlns:DC='http://purl.org/dc/elements/1.1/'>
     <rdf:Description rdf:about=''>
       <dc:title>
         <rdf:Alt>
@@ -93,6 +94,7 @@ def embed_pdf_metadata(
     subject: str = "",
     keywords: str = "",
     publisher: str = "",
+    publication_date: str = "",
     creation_date: str = "",
     write_xmp: bool = True,
     backup: bool = False,
@@ -119,18 +121,28 @@ def embed_pdf_metadata(
         metadata["/Subject"] = subject
     if keywords:
         metadata["/Keywords"] = keywords
-    # Non-standard but often shown as "Company" in some viewers; XMP dc:publisher is primary.
+    # Standard PDF /Publisher field + XMP dc:publisher (both written for max compatibility)
     if publisher.strip():
-        metadata["/Company"] = publisher.strip()
-    # Store creation date as /CreationDate in PDF info dict (D:YYYYMMDDHHmmSS format)
-    if creation_date.strip():
-        # Parse date - archive.org format is often "2026-02-04 17:29:14" or "2010"
-        import re
-        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", creation_date)
+        metadata["/Publisher"] = publisher.strip()
+    # /Date holds the publication/creation date of the work (YYYYMMDD or YYYY only)
+    # Written to both /Date (PDF spec) and dc:date (XMP/Dublin Core)
+    if publication_date.strip():
+        import re as _re
+        pd = publication_date.strip()
+        m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", pd)
         if m:
-            metadata["/CreationDate"] = f"D:{m.group(1)}{m.group(2)}{m.group(3)}"
-        elif re.match(r"^\d{4}$", creation_date.strip()):
-            metadata["/CreationDate"] = f"D:{creation_date.strip()}"
+            metadata["/Date"] = f"D:{m.group(1)}{m.group(2)}{m.group(3)}"
+        elif _re.match(r"^\d{4}$", pd):
+            metadata["/Date"] = f"D:{pd}"
+    # Store file creation timestamp as /CreationDate (D:YYYYMMDDHHmmSS format)
+    if creation_date.strip():
+        import re as _re2
+        cd = creation_date.strip()
+        m2 = _re2.match(r"(\d{4})-(\d{2})-(\d{2})", cd)
+        if m2:
+            metadata["/CreationDate"] = f"D:{m2.group(1)}{m2.group(2)}{m2.group(3)}"
+        elif _re2.match(r"^\d{4}$", cd.strip()):
+            metadata["/CreationDate"] = f"D:{cd.strip()}"
     if not metadata:
         return
 
@@ -154,7 +166,7 @@ def embed_pdf_metadata(
             subject=subject,
             keywords=keywords,
             publisher=publisher,
-            creation_date=creation_date,
+            creation_date=publication_date or creation_date,
         )
         try:
             xmp_stream = DecodedStreamObject()
